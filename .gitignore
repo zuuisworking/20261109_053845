@@ -1,0 +1,11 @@
+node_modules/
+.temp/
+__pycache__/
+logs/
+database/
+storage/
+out/
+
+.env
+.env.*
+!.env.example
