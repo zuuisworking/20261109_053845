@@ -8,15 +8,10 @@ import zipfile
 
 EXCLUDE_PATTERN = [
     ".git",
-	".gitignore",
 	".temp",
  	"__pycache__",
-    "database",
-    "logs",
     "node_modules",
-    "storage",
 ]
-
 
 def is_excluded(path: Path, root: Path, patterns: list[str], output_path: Path) -> bool:
     if path.resolve() == output_path.resolve():

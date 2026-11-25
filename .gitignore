@@ -5,6 +5,7 @@ logs/
 database/
 storage/
 out/
+data/
 
 .env
 .env.*

@@ -18,5 +18,13 @@
   "bugs": {
     "url": "https://github.com/zuuisworking/20261109_053845/issues"
   },
-  "homepage": "https://github.com/zuuisworking/20261109_053845#readme"
+  "homepage": "https://github.com/zuuisworking/20261109_053845#readme",
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "concurrently": "^10.0.7",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "mongoose": "^9.13.1"
+  }
 }
