@@ -45,7 +45,7 @@ def create_archive(root: Path, output_path: Path) -> int:
 def main() -> None:
     root = Path.cwd()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = root / f"{root.name}_{timestamp}.zip"
+    output_path = root / 'out' / f"{root.name}_{timestamp}.zip"
 
     total = create_archive(root, output_path)
     print(f"Successfully Archiving {total} file into: {output_path.name}")
