@@ -1,30 +1,83 @@
 {
-  "name": "20261109_053845",
+  "name": "sigap-ulp-labuhan",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "directories": {
-    "doc": "docs"
+  "private": true,
+  "description": "SIGAP ULP Labuhan - Sistem Informasi Geografis dan Analisis Pembebanan Trafo",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.13.0"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "node backend/src/server.js",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "typecheck": "npm --prefix frontend run typecheck",
+    "start": "node backend/src/server.js",
+    "test": "vitest run --config vitest.config.js",
+    "test:unit": "vitest run --config vitest.config.js tests/unit",
+    "test:integration": "vitest run --config vitest.config.js tests/integration",
+    "test:e2e": "playwright test --config playwright.config.js",
+    "test:visual": "playwright test --config playwright.config.js --grep @visual",
+    "test:coverage": "vitest run --config vitest.config.js --coverage",
+    "lint": "eslint backend/src tests scripts",
+    "lint:contracts": "node scripts/check-api-contract.js",
+    "lint:security": "node scripts/check-security-exceptions.js",
+    "lint:licenses": "node scripts/check-license-policy.js",
+    "lint:action-pins": "node scripts/check-action-pins.js",
+    "lint:action-pins:remote": "node scripts/check-action-pins.js --verify-remote",
+    "test:scripts": "vitest run --config vitest.config.js tests/scripts",
+    "release:validate": "bash scripts/validate-production-release.sh",
+    "release:bundle": "bash scripts/build-release-bundle.sh",
+    "release:bundle:verify": "bash scripts/verify-release-bundle.sh",
+    "release:manifest:create": "node scripts/create-release-manifest.js",
+    "release:manifest:validate": "node scripts/validate-release-manifest.js",
+    "release:controls": "bash scripts/check-github-release-controls.sh",
+    "verify:ground-truth": "node scripts/verify-ground-truth.js",
+    "seed:admin": "node backend/src/database/seedAdmin.js",
+    "migrate:trafo": "node backend/src/database/migrateTrafo.js --dry-run",
+    "migrate:transformer-name-keys": "node backend/src/database/migrateTransformerNameKeys.js --dry-run",
+    "migrate:customers": "node backend/src/database/migrateCustomers.js --dry-run",
+    "migrate:measurements": "node backend/src/database/migrateMeasurements.js --dry-run",
+    "migrate:all": "node backend/src/database/migrateAll.js --dry-run"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/zuuisworking/20261109_053845.git"
+  "keywords": [
+    "PLN",
+    "SIGAP",
+    "transformer-monitoring"
+  ],
+  "license": "UNLICENSED",
+  "overrides": {
+    "uuid": "^11.1.1"
   },
-  "keywords": [],
-  "type": "commonjs",
-  "bugs": {
-    "url": "https://github.com/zuuisworking/20261109_053845/issues"
-  },
-  "homepage": "https://github.com/zuuisworking/20261109_053845#readme",
   "dependencies": {
     "ajv": "^8.20.0",
-    "concurrently": "^10.0.7",
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
+    "csv-parse": "^7.0.3",
+    "csv-stringify": "^6.9.0",
     "dotenv": "^18.0.10",
+    "exceljs": "^4.4.0",
     "express": "^5.3.0",
-    "mongoose": "^9.13.1"
+    "express-rate-limit": "^8.7.5",
+    "helmet": "^8.3.0",
+    "iconv-lite": "^0.7.3",
+    "mongoose": "^9.13.1",
+    "multer": "^2.5.0",
+    "unicode-case-folding": "1.1.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@playwright/test": "^1.65.1",
+    "@vitest/coverage-v8": "^5.1.2",
+    "concurrently": "^10.0.7",
+    "eslint": "^9.39.5",
+    "globals": "^17.14.0",
+    "mongodb-memory-server": "^11.4.0",
+    "pixelmatch": "^7.2.0",
+    "pngjs": "^7.0.0",
+    "supertest": "^7.3.2",
+    "vitest": "^5.1.2"
   }
 }

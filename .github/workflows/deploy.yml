@@ -1,0 +1,733 @@
+name: Deploy to production
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40 character commit SHA to deploy
+        required: false
+        default: ''
+      release_tag:
+        description: Release tag to resolve to an exact commit SHA
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: 22.13.0
+  # The vulnerability scanner is pinned to the reviewed digest. It is not
+  # taken from a repository variable: an operator-controlled or mutable
+  # scanner reference in the production publish path would replace the
+  # reviewed scanner with an unreviewed one. The publish job asserts that
+  # the reference below is still the approved digest.
+  TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7
+  APPROVED_TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7
+
+jobs:
+  resolve:
+    name: Resolve and verify the release revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+    steps:
+      - name: Check out the triggering revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Resolve the exact source SHA
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          PROTECTED_BRANCH: ${{ vars.RELEASE_PROTECTED_BRANCH || 'main' }}
+          RELEASE_TAG_PATTERN: ${{ vars.RELEASE_TAG_PATTERN || 'v*' }}
+        run: |
+          set -euo pipefail
+
+          # A release tag is an explicit release marker. Lightweight and
+          # annotated tags are both supported: an annotated tag is peeled to
+          # the commit it points at.
+          is_release_tag() {
+            local candidate="$1"
+            [[ -n "${RELEASE_TAG_PATTERN}" && "${candidate}" == ${RELEASE_TAG_PATTERN} ]]
+          }
+
+          normalise_ref() {
+            local ref="$1"
+            ref="${ref#refs/heads/}"
+            ref="${ref#refs/tags/}"
+            printf '%s' "${ref}"
+          }
+
+          resolve_tag_to_commit() {
+            local tag="$1"
+            local listing peeled="" direct="" sha ref
+            listing="$(git ls-remote origin "refs/tags/${tag}" "refs/tags/${tag}^{}" 2>/dev/null || true)"
+            while IFS=$'\t' read -r sha ref; do
+              [[ -n "${sha}" ]] || continue
+              if [[ "${ref}" == "refs/tags/${tag}^{}" ]]; then
+                peeled="${sha}"
+              elif [[ "${ref}" == "refs/tags/${tag}" ]]; then
+                direct="${sha}"
+              fi
+            done <<< "${listing}"
+            if [[ -n "${peeled}" ]]; then
+              printf '%s' "${peeled}"
+              return 0
+            fi
+            if [[ -n "${direct}" ]]; then
+              printf '%s' "${direct}"
+              return 0
+            fi
+            return 1
+          }
+
+          source_sha=""
+          source_ref=""
+
+          if [[ -n "${WORKFLOW_RUN_SHA}" ]]; then
+            if [[ "${WORKFLOW_RUN_CONCLUSION}" != "success" ]]; then
+              echo "The CI workflow for ${WORKFLOW_RUN_SHA} concluded with '${WORKFLOW_RUN_CONCLUSION}'." >&2
+              exit 1
+            fi
+            triggering_ref="$(normalise_ref "${WORKFLOW_RUN_HEAD_BRANCH}")"
+            if [[ "${triggering_ref}" != "${PROTECTED_BRANCH}" ]] && ! is_release_tag "${triggering_ref}"; then
+              echo "A deployment may only start from the protected branch '${PROTECTED_BRANCH}' or from a release tag matching '${RELEASE_TAG_PATTERN}'; got '${WORKFLOW_RUN_HEAD_BRANCH}'." >&2
+              exit 1
+            fi
+            if [[ "${WORKFLOW_RUN_EVENT}" != "push" && "${WORKFLOW_RUN_EVENT}" != "workflow_dispatch" ]]; then
+              echo "The triggering CI run was a '${WORKFLOW_RUN_EVENT}' run, which does not prove a release revision. Only a push or a manual CI run on the protected branch or on a release tag may be deployed." >&2
+              exit 1
+            fi
+            source_sha="${WORKFLOW_RUN_SHA}"
+            source_ref="${triggering_ref}"
+          elif [[ -n "${INPUT_SOURCE_SHA}" ]]; then
+            source_sha="${INPUT_SOURCE_SHA}"
+            source_ref="manual source_sha"
+          elif [[ -n "${INPUT_RELEASE_TAG}" ]]; then
+            if ! is_release_tag "${INPUT_RELEASE_TAG}"; then
+              echo "The tag '${INPUT_RELEASE_TAG}' does not match the release tag pattern '${RELEASE_TAG_PATTERN}'." >&2
+              exit 1
+            fi
+            if ! source_sha="$(resolve_tag_to_commit "${INPUT_RELEASE_TAG}")"; then
+              echo "The tag '${INPUT_RELEASE_TAG}' could not be resolved to an exact commit SHA." >&2
+              exit 1
+            fi
+            source_ref="${INPUT_RELEASE_TAG}"
+          else
+            echo "A source_sha or a release_tag input is required for a manual deployment." >&2
+            exit 1
+          fi
+
+          if [[ ! "${source_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "The resolved source revision '${source_sha}' is not an exact 40 character commit SHA." >&2
+            exit 1
+          fi
+
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "image_tag=sha-${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved release revision ${source_sha} (${source_ref})."
+      - name: Verify that CI succeeded for this exact revision from an allowed ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+          PROTECTED_BRANCH: ${{ vars.RELEASE_PROTECTED_BRANCH || 'main' }}
+          RELEASE_TAG_PATTERN: ${{ vars.RELEASE_TAG_PATTERN || 'v*' }}
+        run: |
+          set -euo pipefail
+
+          is_release_tag() {
+            local candidate="$1"
+            [[ -n "${RELEASE_TAG_PATTERN}" && "${candidate}" == ${RELEASE_TAG_PATTERN} ]]
+          }
+
+          # A pull_request CI run proves that a change is testable, not that
+          # the change is releasable. Only a push or a manual CI run on the
+          # protected branch or on an explicit release tag may authorise a
+          # deployment.
+          candidate_runs="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SOURCE_SHA}&status=success&per_page=100" \
+            --jq '.workflow_runs[] | [.id, .event, .head_branch] | @tsv')"
+
+          authorised=0
+          rejected=0
+          while IFS=$'\t' read -r run_id run_event run_ref; do
+            [[ -n "${run_id}" ]] || continue
+            if [[ "${run_event}" != "push" && "${run_event}" != "workflow_dispatch" ]]; then
+              echo "Ignoring CI run ${run_id}: it is a '${run_event}' run, which does not authorise a deployment." >&2
+              rejected=$((rejected + 1))
+              continue
+            fi
+            normalised_ref="${run_ref#refs/heads/}"
+            normalised_ref="${normalised_ref#refs/tags/}"
+            if [[ "${normalised_ref}" == "${PROTECTED_BRANCH}" ]]; then
+              echo "CI run ${run_id} (${run_event}) passed for the protected branch '${normalised_ref}'."
+              authorised=1
+              break
+            fi
+            if is_release_tag "${normalised_ref}"; then
+              echo "CI run ${run_id} (${run_event}) passed for the release tag '${normalised_ref}'."
+              authorised=1
+              break
+            fi
+            echo "Ignoring CI run ${run_id}: it ran on '${normalised_ref}', which is neither the protected branch nor a release tag." >&2
+            rejected=$((rejected + 1))
+          done <<< "${candidate_runs}"
+
+          if [[ "${authorised}" != "1" ]]; then
+            echo "No successful CI run exists for ${SOURCE_SHA} on the protected branch '${PROTECTED_BRANCH}' or on a release tag matching '${RELEASE_TAG_PATTERN}'. The deployment is refused." >&2
+            exit 1
+          fi
+          echo "CI succeeded for ${SOURCE_SHA} on an allowed ref (${rejected} run(s) ignored)."
+      - name: Check out the exact revision and verify it
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify the checked out revision
+        env:
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          checked_out="$(git rev-parse HEAD)"
+          if [[ "${checked_out}" != "${SOURCE_SHA}" ]]; then
+            echo "The checkout resolved to ${checked_out} instead of ${SOURCE_SHA}." >&2
+            exit 1
+          fi
+          echo "Verified checkout of ${checked_out}."
+
+  publish:
+    name: Build, scan, and publish revision images
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      backend_image: ${{ steps.backend.outputs.image }}
+      frontend_image: ${{ steps.frontend.outputs.image }}
+      backend_digest: ${{ steps.backend.outputs.digest }}
+      frontend_digest: ${{ steps.frontend.outputs.digest }}
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push the backend image
+        id: backend
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          # Only revision tagged images are published. There is no `latest`
+          # tag and no tag is derived from an arbitrary ref.
+          tags: ghcr.io/${{ github.repository }}/backend:sha-${{ needs.resolve.outputs.source_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.source_sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+      - name: Build and push the frontend image
+        id: frontend
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}/frontend:sha-${{ needs.resolve.outputs.source_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.source_sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+      - name: Record the published image digests
+        id: images
+        env:
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${BACKEND_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "The backend image digest '${BACKEND_DIGEST}' is not an exact sha256 digest." >&2
+            exit 1
+          fi
+          if [[ ! "${FRONTEND_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "The frontend image digest '${FRONTEND_DIGEST}' is not an exact sha256 digest." >&2
+            exit 1
+          fi
+          {
+            echo "backend=ghcr.io/${GITHUB_REPOSITORY}/backend@${BACKEND_DIGEST}"
+            echo "frontend=ghcr.io/${GITHUB_REPOSITORY}/frontend@${FRONTEND_DIGEST}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Verify the vulnerability scanner reference
+        run: |
+          set -euo pipefail
+          # The scanner that scans the published digests must be the reviewed
+          # one, referenced by its exact digest. A mutable tag, or a
+          # reference that differs from the approved digest, fails the
+          # publish job before any image is scanned.
+          if [[ "${TRIVY_IMAGE}" != "${APPROVED_TRIVY_IMAGE}" ]]; then
+            echo "::error::The vulnerability scanner '${TRIVY_IMAGE}' is not the approved reference '${APPROVED_TRIVY_IMAGE}'. The publish job is refused."
+            exit 1
+          fi
+          if [[ ! "${TRIVY_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::The vulnerability scanner '${TRIVY_IMAGE}' is not an exact digest reference; the publish job is refused."
+            exit 1
+          fi
+          echo "The vulnerability scanner is pinned to the approved digest."
+      - name: Scan the published backend digest
+        env:
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          node scripts/build-trivy-ignorefile.js --out artifacts/trivy-ignore.json
+          # The scan runs against the exact digest that was published, not
+          # against the local build, so the approval covers the bytes that the
+          # host will pull.
+          docker run --rm \
+            -v "${HOME}/.docker:/root/.docker:ro" \
+            -v "${PWD}/artifacts:/out" \
+            "${TRIVY_IMAGE}" \
+            image --exit-code 1 --severity HIGH,CRITICAL \
+            --ignorefile /out/trivy-ignore.json \
+            --format json --output /out/trivy-backend-published.json \
+            "ghcr.io/${GITHUB_REPOSITORY}/backend@${BACKEND_DIGEST}"
+      - name: Scan the published frontend digest
+        env:
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+          TRIVY_IMAGE: ${{ env.TRIVY_IMAGE }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          node scripts/build-trivy-ignorefile.js --out artifacts/trivy-ignore.json
+          docker run --rm \
+            -v "${HOME}/.docker:/root/.docker:ro" \
+            -v "${PWD}/artifacts:/out" \
+            "${TRIVY_IMAGE}" \
+            image --exit-code 1 --severity HIGH,CRITICAL \
+            --ignorefile /out/trivy-ignore.json \
+            --format json --output /out/trivy-frontend-published.json \
+            "ghcr.io/${GITHUB_REPOSITORY}/frontend@${FRONTEND_DIGEST}"
+      - name: Upload the published image scan evidence
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: published-image-scan-${{ needs.resolve.outputs.source_sha }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Build the release bundle
+        run: |
+          set -euo pipefail
+          bash scripts/build-release-bundle.sh \
+            --output "${RUNNER_TEMP}/release" \
+            --source-sha "${{ needs.resolve.outputs.source_sha }}" \
+            --archive
+      - name: Record the approval evidence
+        id: approval
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          approver="$(gh api "repos/${GITHUB_REPOSITORY}/deployments?ref=${SOURCE_SHA}&per_page=10" \
+            --jq '[.[] | select(.environment == "production")] | first | .creator.login // empty')"
+          if [[ -z "${approver}" ]]; then
+            echo "No production deployment record with an approver was found for ${SOURCE_SHA}. The release approval cannot be recorded." >&2
+            exit 1
+          fi
+          approved_at="$(gh api "repos/${GITHUB_REPOSITORY}/deployments?ref=${SOURCE_SHA}&per_page=10" \
+            --jq '[.[] | select(.environment == "production")] | first | .created_at // empty')"
+          echo "approver=${approver}" >> "${GITHUB_OUTPUT}"
+          echo "approved_at=${approved_at}" >> "${GITHUB_OUTPUT}"
+      - name: Create and sign the release manifest
+        env:
+          BACKEND_IMAGE: ${{ steps.images.outputs.backend }}
+          FRONTEND_IMAGE: ${{ steps.images.outputs.frontend }}
+          MONGO_IMAGE: ${{ vars.MONGO_IMAGE }}
+          CADDY_IMAGE: ${{ vars.CADDY_IMAGE }}
+          RELEASE_MANIFEST_SIGNING_KEY_B64: ${{ secrets.RELEASE_MANIFEST_SIGNING_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          # A production release manifest is always signed. There is no
+          # unsigned path: a missing signing key fails the publish job
+          # instead of producing a manifest that the deployment job would
+          # accept.
+          if [[ -z "${RELEASE_MANIFEST_SIGNING_KEY_B64}" ]]; then
+            echo "::error::RELEASE_MANIFEST_SIGNING_KEY_B64 is not configured. A production release manifest must be signed; the release is refused."
+            exit 1
+          fi
+          printf '%s' "${RELEASE_MANIFEST_SIGNING_KEY_B64}" | base64 --decode > "${RUNNER_TEMP}/release-manifest.key"
+          chmod 600 "${RUNNER_TEMP}/release-manifest.key"
+          if [[ ! -s "${RUNNER_TEMP}/release-manifest.key" ]]; then
+            echo "::error::The decoded release manifest signing key is empty; the release is refused."
+            exit 1
+          fi
+          node scripts/create-release-manifest.js \
+            --output "${RUNNER_TEMP}/release/release-manifest.json" \
+            --source-sha "${{ needs.resolve.outputs.source_sha }}" \
+            --bundle "${RUNNER_TEMP}/release/sigap-release-${{ needs.resolve.outputs.source_sha }}.tar.gz" \
+            --approver "${{ steps.approval.outputs.approver }}" \
+            --approved-at "${{ steps.approval.outputs.approved_at }}" \
+            --sign "${RUNNER_TEMP}/release-manifest.key"
+          # The signature file is part of the release. Its absence is a
+          # failure, not an optional extra.
+          if [[ ! -s "${RUNNER_TEMP}/release/release-manifest.json.sig" ]]; then
+            echo "::error::The release manifest was not signed; the signature file is missing; the release is refused."
+            exit 1
+          fi
+          rm -f "${RUNNER_TEMP}/release-manifest.key"
+      - name: Upload the release bundle and manifest
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: release-bundle-${{ needs.resolve.outputs.source_sha }}
+          path: |
+            ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy:
+    name: Roll out to the production host
+    needs: [resolve, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      BACKEND_IMAGE: ${{ needs.publish.outputs.backend_image }}
+      FRONTEND_IMAGE: ${{ needs.publish.outputs.frontend_image }}
+      DEPLOY_HOST: ${{ secrets.VPS_HOST }}
+      DEPLOY_USER: ${{ secrets.VPS_USER }}
+      DEPLOY_PORT: ${{ secrets.VPS_SSH_PORT }}
+      DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
+      PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL }}
+      PUBLIC_HOST: ${{ vars.PUBLIC_HOST }}
+      MONGO_IMAGE: ${{ vars.MONGO_IMAGE }}
+      CADDY_IMAGE: ${{ vars.CADDY_IMAGE }}
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Download the release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-bundle-${{ needs.resolve.outputs.source_sha }}
+          path: ${{ runner.temp }}/release
+      - name: Verify the release bundle locally
+        run: |
+          set -euo pipefail
+          bash scripts/verify-release-bundle.sh --bundle "${RUNNER_TEMP}/release/bundle"
+      - name: Validate the release configuration locally
+        env:
+          EXPECTED_GHCR_OWNER: ${{ github.repository_owner }}
+          EXPECTED_GHCR_REPOSITORY: ${{ github.repository }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+          MONGO_ROOT_USERNAME: ${{ secrets.MONGO_ROOT_USERNAME }}
+          MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
+          MONGO_APP_USERNAME: ${{ secrets.MONGO_APP_USERNAME }}
+          MONGO_APP_PASSWORD: ${{ secrets.MONGO_APP_PASSWORD }}
+          MONGO_BACKUP_USERNAME: ${{ secrets.MONGO_BACKUP_USERNAME }}
+          MONGO_BACKUP_PASSWORD: ${{ secrets.MONGO_BACKUP_PASSWORD }}
+          MONGO_RESTORE_USERNAME: ${{ secrets.MONGO_RESTORE_USERNAME }}
+          MONGO_RESTORE_PASSWORD: ${{ secrets.MONGO_RESTORE_PASSWORD }}
+          COMPOSE_MONGODB_URI: ${{ secrets.COMPOSE_MONGODB_URI }}
+          CLIENT_URLS: ${{ vars.CLIENT_URLS }}
+          ACME_EMAIL: ${{ vars.ACME_EMAIL }}
+          RELEASE_DIR: ${{ runner.temp }}/release/bundle
+          RELEASE_MANIFEST: ${{ runner.temp }}/release/release-manifest.json
+          RELEASE_MANIFEST_SIGNATURE: ${{ runner.temp }}/release/release-manifest.json.sig
+          RELEASE_MANIFEST_PUBLIC_KEY_B64: ${{ secrets.RELEASE_MANIFEST_PUBLIC_KEY_B64 }}
+          # The manifest records the checksum of the release bundle archive.
+          # The archive itself is supplied, so the recorded checksum is
+          # verified against the actual bytes and not only against its
+          # format.
+          BUNDLE_ARCHIVE: ${{ runner.temp }}/release/sigap-release-${{ needs.resolve.outputs.source_sha }}.tar.gz
+        run: |
+          set -euo pipefail
+          # The release manifest signature is mandatory. The public key is
+          # required, the signature requirement is always enabled, and an
+          # unsigned or tampered manifest fails the rollout.
+          if [[ -z "${RELEASE_MANIFEST_PUBLIC_KEY_B64}" ]]; then
+            echo "::error::RELEASE_MANIFEST_PUBLIC_KEY_B64 is not configured. A production rollout verifies the release manifest signature; the rollout is refused."
+            exit 1
+          fi
+          printf '%s' "${RELEASE_MANIFEST_PUBLIC_KEY_B64}" | base64 --decode \
+            > "${RUNNER_TEMP}/release-manifest.pub"
+          chmod 600 "${RUNNER_TEMP}/release-manifest.pub"
+          if [[ ! -s "${RUNNER_TEMP}/release-manifest.pub" ]]; then
+            echo "::error::The decoded release manifest public key is empty; the rollout is refused."
+            exit 1
+          fi
+          export RELEASE_MANIFEST_PUBLIC_KEY="${RUNNER_TEMP}/release-manifest.pub"
+          export REQUIRE_RELEASE_MANIFEST_SIGNATURE=true
+          if [[ ! -s "${RELEASE_MANIFEST_SIGNATURE}" ]]; then
+            echo "::error::The release manifest signature file ${RELEASE_MANIFEST_SIGNATURE} is missing; the rollout is refused."
+            exit 1
+          fi
+          if [[ ! -s "${BUNDLE_ARCHIVE}" ]]; then
+            echo "::error::The release bundle archive ${BUNDLE_ARCHIVE} is missing; the recorded bundle checksum cannot be verified; the rollout is refused."
+            exit 1
+          fi
+          bash scripts/validate-production-release.sh
+      - name: Configure SSH with a pinned host key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_HOST_KEY: ${{ secrets.VPS_SSH_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${SSH_HOST_KEY}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o BatchMode=yes -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" true
+      - name: Copy the release bundle to the host
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "mkdir -p '${DEPLOY_PATH}/releases/${SOURCE_SHA}' && rm -rf '${DEPLOY_PATH}/releases/${SOURCE_SHA}/bundle'"
+          scp -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -P "${DEPLOY_PORT}" -r "${RUNNER_TEMP}/release/bundle" \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/${SOURCE_SHA}/bundle"
+          scp -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -P "${DEPLOY_PORT}" "${RUNNER_TEMP}/release/release-manifest.json" \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/${SOURCE_SHA}/release-manifest.json"
+          # The signature file is required. It is copied unconditionally, and
+          # the rollout refuses to continue when it is missing.
+          if [[ ! -s "${RUNNER_TEMP}/release/release-manifest.json.sig" ]]; then
+            echo "::error::The release manifest signature file is missing; the rollout is refused."
+            exit 1
+          fi
+          scp -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -P "${DEPLOY_PORT}" "${RUNNER_TEMP}/release/release-manifest.json.sig" \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/${SOURCE_SHA}/release-manifest.json.sig"
+      - name: Verify the bundle and the Caddy configuration on the host
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "bash '${DEPLOY_PATH}/releases/${SOURCE_SHA}/bundle/scripts/verify-release-bundle.sh' \
+              --bundle '${DEPLOY_PATH}/releases/${SOURCE_SHA}/bundle'"
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "docker run --rm -e PUBLIC_HOST='${PUBLIC_HOST}' -e ACME_EMAIL='${ACME_EMAIL}' \
+              -v '${DEPLOY_PATH}/releases/${SOURCE_SHA}/bundle/Caddyfile:/etc/caddy/Caddyfile:ro' \
+              '${CADDY_IMAGE}' caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
+      - name: Authenticate the host to GHCR for this rollout
+        env:
+          GHCR_USERNAME: ${{ secrets.VPS_GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.VPS_GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" | ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "docker login ghcr.io --username '${GHCR_USERNAME}' --password-stdin"
+      - name: Read the approved image set from the release manifest
+        id: approved
+        env:
+          RELEASE_MANIFEST: ${{ runner.temp }}/release/release-manifest.json
+        run: |
+          set -euo pipefail
+          # The approved image set is the one that is recorded in the signed
+          # release manifest, not the one that happens to be configured in the
+          # workflow or on the host. The host checks below compare the
+          # effective Compose image set against these values.
+          node -e '
+            const fs = require("fs");
+            const manifest = JSON.parse(
+              fs.readFileSync(process.env.RELEASE_MANIFEST, "utf8")
+            );
+            const images = manifest.images || {};
+            for (const name of ["backend", "frontend", "mongo", "caddy"]) {
+              const value = images[name] || "";
+              if (!/@sha256:[0-9a-f]{64}$/.test(value)) {
+                process.stderr.write(
+                  `The release manifest does not record an exact ${name} digest.\n`
+                );
+                process.exit(1);
+              }
+              process.stdout.write(`${name}=${value}\n`);
+            }
+          ' | while IFS='=' read -r name value; do
+              echo "${name}=${value}" >> "${GITHUB_OUTPUT}"
+            done
+          echo "Approved image set read from the release manifest."
+      - name: Capture the rollback reference and install the release files
+        run: |
+          set -euo pipefail
+          # The rollback reference is captured before the new revision is
+          # written, and the release files are installed before the image set
+          # is verified, so that the verification sees exactly the Compose
+          # project that would be rolled out.
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -euo pipefail;
+             cd '${DEPLOY_PATH}';
+             mkdir -p mongo/init scripts/lib rollback;
+             cp -f 'releases/${SOURCE_SHA}/bundle/docker-compose.prod.yml' docker-compose.prod.yml;
+             cp -f 'releases/${SOURCE_SHA}/bundle/Caddyfile' Caddyfile;
+             cp -f 'releases/${SOURCE_SHA}/bundle/mongo/init/01-create-users.js' mongo/init/01-create-users.js;
+             cp -f 'releases/${SOURCE_SHA}/bundle/scripts/backup-mongodb.sh' scripts/backup-mongodb.sh;
+             cp -f 'releases/${SOURCE_SHA}/bundle/scripts/restore-mongodb.sh' scripts/restore-mongodb.sh;
+             cp -f 'releases/${SOURCE_SHA}/bundle/scripts/validate-production-release.sh' scripts/validate-production-release.sh;
+             cp -f 'releases/${SOURCE_SHA}/bundle/scripts/verify-host-image-set.sh' scripts/verify-host-image-set.sh;
+             cp -f 'releases/${SOURCE_SHA}/bundle/scripts/prepare-release-env.sh' scripts/prepare-release-env.sh;
+             cp -f 'releases/${SOURCE_SHA}/bundle/scripts/lib/release-common.sh' scripts/lib/release-common.sh"
+      - name: Record the release environment and the rollback reference
+        run: |
+          set -euo pipefail
+          # The release environment and the rollback reference both contain
+          # the complete approved four-image set. A rollback that only
+          # restored the application images would leave a newly approved
+          # MongoDB or Caddy image in place, so the rolled-back stack would
+          # not be the stack that was approved before.
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "bash '${DEPLOY_PATH}/scripts/prepare-release-env.sh' \
+              --deploy-path '${DEPLOY_PATH}' \
+              --source-sha '${SOURCE_SHA}' \
+              --backend-image '${{ steps.approved.outputs.backend }}' \
+              --frontend-image '${{ steps.approved.outputs.frontend }}' \
+              --mongo-image '${{ steps.approved.outputs.mongo }}' \
+              --caddy-image '${{ steps.approved.outputs.caddy }}'"
+          # The recorded rollback reference is verified before the rollout:
+          # it must restore the complete four-image set. The only exception
+          # is the initial installation, which the script records explicitly.
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -euo pipefail;
+             if [ -f '${DEPLOY_PATH}/rollback/${SOURCE_SHA}.env' ]; then
+               bash '${DEPLOY_PATH}/scripts/prepare-release-env.sh' --verify '${DEPLOY_PATH}/rollback/${SOURCE_SHA}.env';
+             elif [ -f '${DEPLOY_PATH}/rollback/${SOURCE_SHA}.no-previous-release' ]; then
+               echo '::warning::The host had no previous release; this is the initial installation and there is no rollback reference.';
+             else
+               echo '::error::No rollback reference was recorded for ${SOURCE_SHA}; the rollout is refused.';
+               exit 1;
+             fi"
+      - name: Verify the effective host image set against the approved digests
+        run: |
+          set -euo pipefail
+          # The host resolves the images again from its own environment files.
+          # This check compares the effective Compose image set with the
+          # digests that the approved release manifest recorded, so a stale
+          # MONGO_IMAGE or CADDY_IMAGE in the host .env cannot deploy an
+          # image that was never validated or approved.
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "bash '${DEPLOY_PATH}/scripts/verify-host-image-set.sh' \
+              --compose-file '${DEPLOY_PATH}/docker-compose.prod.yml' \
+              --env-file '${DEPLOY_PATH}/.env' \
+              --env-file '${DEPLOY_PATH}/.release.env' \
+              --expected '${{ steps.approved.outputs.backend }}' \
+              --expected '${{ steps.approved.outputs.frontend }}' \
+              --expected '${{ steps.approved.outputs.mongo }}' \
+              --expected '${{ steps.approved.outputs.caddy }}'"
+      - name: Start the release
+        run: |
+          set -euo pipefail
+          # Docker Compose gives the process environment a higher precedence
+          # than an --env-file value. The four image variables are therefore
+          # removed from the ambient environment, so that the rollout
+          # resolves exactly the same image set that
+          # scripts/verify-host-image-set.sh verified a moment earlier. An
+          # image variable in the host shell profile cannot change what is
+          # deployed.
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -euo pipefail;
+             cd '${DEPLOY_PATH}';
+             unset BACKEND_IMAGE FRONTEND_IMAGE MONGO_IMAGE CADDY_IMAGE;
+             docker compose --env-file .env --env-file .release.env -f docker-compose.prod.yml pull;
+             docker compose --env-file .env --env-file .release.env -f docker-compose.prod.yml up -d --wait --remove-orphans;
+             docker compose --env-file .env --env-file .release.env -f docker-compose.prod.yml ps"
+      - name: Smoke check the readiness endpoint
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-connrefused \
+            "${PUBLIC_APP_URL%/}/api/ready" | tee /tmp/readiness.json
+          grep -q '"status":"ok"' /tmp/readiness.json
+      - name: Smoke check the static frontend and the TLS endpoint
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-connrefused \
+            "${PUBLIC_APP_URL%/}/healthz"
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-connrefused \
+            --resolve "${PUBLIC_HOST}:443:$(dig +short "${PUBLIC_HOST}" | head -n 1)" \
+            "https://${PUBLIC_HOST}/healthz" >/dev/null
+      - name: Record the release evidence
+        if: always()
+        env:
+          APPROVED_MONGO_IMAGE: ${{ steps.approved.outputs.mongo }}
+          APPROVED_CADDY_IMAGE: ${{ steps.approved.outputs.caddy }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'sourceSha=%s\n' "${SOURCE_SHA}"
+            printf 'backendImage=%s\n' "${BACKEND_IMAGE}"
+            printf 'frontendImage=%s\n' "${FRONTEND_IMAGE}"
+            # The complete approved four-image set is recorded, so that the
+            # evidence matches the release environment and the rollback
+            # reference that were written on the host.
+            printf 'mongoImage=%s\n' "${APPROVED_MONGO_IMAGE:-not-recorded}"
+            printf 'caddyImage=%s\n' "${APPROVED_CADDY_IMAGE:-not-recorded}"
+            printf 'rollbackReference=%s\n' "${DEPLOY_PATH}/rollback/${SOURCE_SHA}.env"
+            printf 'publicAppUrl=%s\n' "${PUBLIC_APP_URL}"
+            printf 'recordedAt=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Remove the temporary registry credential
+        if: always()
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -p "${DEPLOY_PORT}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "docker logout ghcr.io" || true

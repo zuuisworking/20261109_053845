@@ -1,0 +1,406 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # A release tag produces a CI run whose head_branch is the tag name.
+    # The deploy workflow requires such a run before it may deploy the tag.
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 22.13.0
+  # Every third-party image is pinned to an exact digest that was resolved from
+  # the upstream registry manifest.
+  ACTIONLINT_IMAGE: rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9
+  TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.24.2@sha256:b5918eb91b8d2473cec722f066abb4352e4ffdc4ec9f4283ec143aba9ec9ebc4
+
+jobs:
+  lint:
+    name: Lint, type check, and shell syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install root dependencies
+        run: npm ci
+      - name: Root lint
+        run: npm run lint
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+      - name: Frontend type check
+        run: npm run typecheck
+        working-directory: frontend
+      - name: Shell syntax check
+        run: |
+          set -euo pipefail
+          for script in scripts/*.sh scripts/lib/*.sh; do
+            bash -n "${script}"
+          done
+      - name: Validate GitHub Actions workflow expressions
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${PWD}:/repo" \
+            -w /repo \
+            "${ACTIONLINT_IMAGE}" \
+            -color
+      - name: ShellCheck
+        run: |
+          set -euo pipefail
+          shellcheck --severity=warning scripts/*.sh scripts/lib/*.sh
+
+  action-pins:
+    name: GitHub Action pin gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Verify the recorded pins against the registry
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          node scripts/check-action-pins.js --report artifacts/action-pins.json
+      - name: Verify the recorded pins against the upstream repositories
+        # A commit that the upstream API does not resolve fails the job. An
+        # unreachable or rate-limited upstream API is a warning only.
+        run: node scripts/check-action-pins.js --verify-remote --allow-unavailable
+      - name: Upload the pin gate evidence
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: action-pin-evidence
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  contracts:
+    name: Static contract and security policy gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install root dependencies
+        run: npm ci
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+      - name: API contract gate
+        run: node scripts/check-api-contract.js --report artifacts/contract-gate.json
+      - name: Security exception registry gate
+        run: node scripts/check-security-exceptions.js
+      - name: License policy gate
+        run: node scripts/check-license-policy.js --report artifacts/license-report.json
+      - name: Upload gate evidence
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: policy-gate-evidence
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  backend:
+    name: Backend test and audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mongo:
+        image: mongo:8.0@sha256:479e85ced54ffb8a40dade1dcde2da2a9ae858515b9415e9cc54bfb8f0575d01
+        env:
+          MONGO_INITDB_ROOT_USERNAME: sigap
+          MONGO_INITDB_ROOT_PASSWORD: sigap-test-password
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --username sigap --password sigap-test-password --authenticationDatabase admin --eval 'db.adminCommand(\"ping\").ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NODE_ENV: test
+      MONGODB_URI: mongodb://sigap:sigap-test-password@127.0.0.1:27017/sigap_ulp_labuhan_test?authSource=admin
+      MONGODB_URI_TEST: mongodb://sigap:sigap-test-password@127.0.0.1:27017/sigap_ulp_labuhan_test?authSource=admin
+      SESSION_SECRET: ci-session-secret-with-at-least-thirty-two-random-bytes
+      CLIENT_URL: http://localhost:5173
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:coverage
+      - name: Dependency vulnerability scan
+        run: |
+          set -euo pipefail
+          node scripts/build-trivy-ignorefile.js --out artifacts/trivy-ignore.json
+          docker run --rm \
+            -v "${PWD}:/work" \
+            -v "${PWD}/artifacts:/out" \
+            "${TRIVY_IMAGE}" \
+            fs --scanners vuln --security-checks vuln \
+            --exit-code 1 --severity HIGH,CRITICAL \
+            --ignorefile /out/trivy-ignore.json \
+            --format json --output /out/trivy-fs.json \
+            /work
+      - name: Upload dependency scan evidence
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: backend-dependency-scan
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  frontend:
+    name: Frontend test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm test -- --run
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+      - name: Dependency vulnerability scan
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          node scripts/build-trivy-ignorefile.js --out artifacts/trivy-ignore.json
+          docker run --rm \
+            -v "${PWD}/frontend:/work" \
+            -v "${PWD}/artifacts:/out" \
+            "${TRIVY_IMAGE}" \
+            fs --scanners vuln --security-checks vuln \
+            --exit-code 1 --severity HIGH,CRITICAL \
+            --ignorefile /out/trivy-ignore.json \
+            --format json --output /out/trivy-frontend.json \
+            /work
+
+  e2e:
+    name: End-to-end and visual tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      mongo:
+        image: mongo:8.0@sha256:479e85ced54ffb8a40dade1dcde2da2a9ae858515b9415e9cc54bfb8f0575d01
+        env:
+          MONGO_INITDB_ROOT_USERNAME: sigap
+          MONGO_INITDB_ROOT_PASSWORD: sigap-test-password
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --username sigap --password sigap-test-password --authenticationDatabase admin --eval 'db.adminCommand(\"ping\").ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MONGODB_URI: mongodb://sigap:sigap-test-password@127.0.0.1:27017/sigap_ulp_labuhan_e2e?authSource=admin
+      MONGODB_URI_E2E: mongodb://sigap:sigap-test-password@127.0.0.1:27017/sigap_ulp_labuhan_e2e?authSource=admin
+      SESSION_SECRET: e2e-session-secret-with-at-least-thirty-two-random-bytes
+      CLIENT_URL: http://127.0.0.1:5173
+      CLIENT_URLS: http://127.0.0.1:5173
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm ci
+        working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan the commit history
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${PWD}:/repo" -w /repo \
+            "${GITLEAKS_IMAGE}" detect --source=/repo --redact --verbose --exit-code 1
+      - name: Scan the working tree
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${PWD}:/repo" -w /repo \
+            "${GITLEAKS_IMAGE}" detect --source=/repo --no-git --redact --verbose --exit-code 1
+
+  images:
+    name: Container images, scan, and SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [lint, action-pins, contracts, backend, frontend, e2e, secrets]
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build the backend image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: false
+          load: true
+          tags: sigap/backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build the frontend image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: false
+          load: true
+          tags: sigap/frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build the approved vulnerability exception ignore file
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          node scripts/build-trivy-ignorefile.js --out artifacts/trivy-ignore.json
+      - name: Scan the backend image
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${PWD}/artifacts:/out" \
+            "${TRIVY_IMAGE}" \
+            image --exit-code 1 --severity HIGH,CRITICAL \
+            --ignorefile /out/trivy-ignore.json \
+            --format json --output /out/trivy-backend-image.json \
+            sigap/backend:ci
+      - name: Scan the frontend image
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${PWD}/artifacts:/out" \
+            "${TRIVY_IMAGE}" \
+            image --exit-code 1 --severity HIGH,CRITICAL \
+            --ignorefile /out/trivy-ignore.json \
+            --format json --output /out/trivy-frontend-image.json \
+            sigap/frontend:ci
+      - name: Generate the software bill of materials
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${PWD}/artifacts:/out" \
+            "${TRIVY_IMAGE}" \
+            image --format cyclonedx --output /out/sbom-backend.cdx.json sigap/backend:ci
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${PWD}/artifacts:/out" \
+            "${TRIVY_IMAGE}" \
+            image --format cyclonedx --output /out/sbom-frontend.cdx.json sigap/frontend:ci
+      - name: Record the build provenance
+        run: |
+          set -euo pipefail
+          {
+            printf '{\n'
+            printf '  "sourceSha": "%s",\n' "$(git rev-parse HEAD)"
+            printf '  "ref": "%s",\n' "${GITHUB_REF}"
+            printf '  "runId": "%s",\n' "${GITHUB_RUN_ID}"
+            printf '  "builtAt": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf '  "builder": "docker/build-push-action",\n'
+            printf '  "attestations": "SBOM and provenance attestations are attached by the deployment workflow when the images are pushed to GHCR."\n'
+            printf '  "backendImageId": "%s",\n' "$(docker image inspect sigap/backend:ci --format '{{.Id}}')"
+            printf '  "frontendImageId": "%s"\n' "$(docker image inspect sigap/frontend:ci --format '{{.Id}}')"
+            printf '}\n'
+          } > artifacts/build-provenance.json
+      - name: Upload image scan and SBOM evidence
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: image-scan-and-sbom
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  release-controls:
+    name: Remote release controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Verify the GitHub environment, rulesets, and pipeline configuration
+        env:
+          # RELEASE_CONTROLS_TOKEN needs repository administration access.
+          # Without it the built-in token is used and the remote controls that
+          # need administration access are reported as unreadable, which
+          # fails the job by design.
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROLS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash scripts/check-github-release-controls.sh --repository "${GITHUB_REPOSITORY}" --skip secrets

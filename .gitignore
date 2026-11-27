@@ -1,12 +1,31 @@
+# Dependencies and build output
 node_modules/
-.temp/
-__pycache__/
-logs/
-database/
-storage/
-out/
-data/
+**/node_modules/
+frontend/dist/
+coverage/
+**/coverage/
+*.tsbuildinfo
+playwright-report/
+test-results/
+blob-report/
+.playwright/
 
+# Protected supplied sources and local runtime data (repository-root only)
+/.temp/
+/logs/
+/database/
+/storage/
+/out/
+/data/
+
+# Python/tool caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+/scripts/audit_tool.py
+
+# Local secrets
 .env
 .env.*
 !.env.example

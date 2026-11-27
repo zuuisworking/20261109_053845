@@ -1,0 +1,17 @@
+.git
+.github
+.temp
+logs
+database
+storage
+out
+data
+coverage
+frontend/dist
+frontend/node_modules
+node_modules
+.env
+.env.*
+!.env.example
+*.log
+*.zip

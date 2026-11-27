@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "policy": {
+    "allowed": [
+      "MIT",
+      "MIT-0",
+      "ISC",
+      "Apache-2.0",
+      "BSD-2-Clause",
+      "BSD-3-Clause",
+      "0BSD",
+      "BlueOak-1.0.0",
+      "CC0-1.0",
+      "CC-BY-4.0",
+      "CC-BY-3.0",
+      "BSD",
+      "Python-2.0",
+      "Python-2.0.1",
+      "Unlicense",
+      "Zlib",
+      "MPL-2.0",
+      "OFL-1.1"
+    ],
+    "denied": [
+      "GPL-2.0",
+      "GPL-2.0-only",
+      "GPL-2.0-or-later",
+      "GPL-3.0",
+      "GPL-3.0-only",
+      "GPL-3.0-or-later",
+      "AGPL-3.0",
+      "AGPL-3.0-only",
+      "AGPL-3.0-or-later",
+      "SSPL-1.0",
+      "BUSL-1.1",
+      "Commons-Clause",
+      "LGPL-2.1",
+      "LGPL-3.0"
+    ],
+    "note": "The license gate is a bounded, dependency-metadata equivalent of a full license scan: it reads the license metadata of every installed package in the root and frontend dependency trees and fails closed on missing, unknown, or denied licenses. A package offered under several alternatives (for example `MIT OR GPL-3.0-or-later`) is accepted when at least one alternative is allowed. It does not inspect license texts, bundled fonts, images, or container base layers; those remain operator review items."
+  },
+  "exceptions": [
+    {
+      "id": "license-buffers-unspecified",
+      "package": "buffers@0.1.1",
+      "license": "UNSPECIFIED",
+      "owner": "dependency-owner",
+      "expiresAt": "2026-12-31",
+      "riskTreatment": "will-fix",
+      "rationale": "The published package.json of the transitive dependency buffers@0.1.1 (pulled in by readable-stream for the ExcelJS import path) contains no license field, so its distribution terms are not declared by the publisher. The package is used unmodified and is pinned by the lockfile integrity hash.",
+      "compensatingControls": [
+        "The package is not vendored into this repository and is installed unmodified from the lockfile.",
+        "No source file of this package is copied into the runtime image by a build step.",
+        "A legal review of the unknown terms is required before any external distribution of the built application."
+      ]
+    }
+  ]
+}

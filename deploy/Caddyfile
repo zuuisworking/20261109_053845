@@ -1,0 +1,30 @@
+{
+	email {$ACME_EMAIL}
+	admin off
+}
+
+{$PUBLIC_HOST} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Every request, including /api/v1/*, is forwarded to the frontend
+	# container. The frontend Nginx image serves the static assets and proxies
+	# the /api/ prefix to the backend container on the internal network.
+	reverse_proxy frontend:8080 {
+		health_uri /healthz
+		health_interval 30s
+		health_timeout 5s
+	}
+}
+
+# Loopback-only health listener used by the Caddy container health check.
+# It never binds a public interface and it does not proxy application traffic.
+http://127.0.0.1:8081 {
+	respond /healthz "ok" 200
+}

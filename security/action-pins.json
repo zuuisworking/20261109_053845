@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "policy": {
+    "description": "Every GitHub Action used by a workflow in this repository must be pinned to an exact 40 character commit SHA. A floating tag or branch is rejected. Each SHA below was verified against the upstream repository with `git ls-remote` and the GitHub commits API.",
+    "verification": "node scripts/check-action-pins.js --verify-remote"
+  },
+  "actions": [
+    {
+      "action": "actions/checkout",
+      "version": "v4.2.2",
+      "sha": "11bd71901bbe5b1630ceea73d27597364c9af683",
+      "verifiedAt": "2026-11-27"
+    },
+    {
+      "action": "actions/setup-node",
+      "version": "v4.4.0",
+      "sha": "49933ea5288caeca8642d1e84afbd3f7d6820020",
+      "verifiedAt": "2026-11-27"
+    },
+    {
+      "action": "actions/upload-artifact",
+      "version": "v4.4.3",
+      "sha": "b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882",
+      "verifiedAt": "2026-11-27"
+    },
+    {
+      "action": "actions/download-artifact",
+      "version": "v4.3.0",
+      "sha": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+      "verifiedAt": "2026-11-27"
+    },
+    {
+      "action": "docker/setup-buildx-action",
+      "version": "v3.12.0",
+      "sha": "8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
+      "verifiedAt": "2026-11-27"
+    },
+    {
+      "action": "docker/login-action",
+      "version": "v3.6.0",
+      "sha": "5e57cd118135c172c3672efd75eb46360885c0ef",
+      "verifiedAt": "2026-11-27"
+    },
+    {
+      "action": "docker/build-push-action",
+      "version": "v6.19.2",
+      "sha": "10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
+      "verifiedAt": "2026-11-27"
+    }
+  ]
+}

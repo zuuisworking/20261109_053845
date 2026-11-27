@@ -1,0 +1,104 @@
+name: sigap-ulp-labuhan
+
+services:
+  mongo:
+    image: ${MONGO_IMAGE:-mongo:8.0}
+    restart: unless-stopped
+    command: ["mongod", "--bind_ip_all"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?MONGO_ROOT_USERNAME is required}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD is required}
+      MONGO_DATABASE: ${MONGO_DATABASE:-sigap_ulp_labuhan}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:?MONGO_APP_USERNAME is required}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?MONGO_APP_PASSWORD is required}
+      MONGO_BACKUP_USERNAME: ${MONGO_BACKUP_USERNAME:?MONGO_BACKUP_USERNAME is required}
+      MONGO_BACKUP_PASSWORD: ${MONGO_BACKUP_PASSWORD:?MONGO_BACKUP_PASSWORD is required}
+      MONGO_RESTORE_DATABASE: ${MONGO_RESTORE_DATABASE:-sigap_ulp_labuhan_restore}
+      MONGO_RESTORE_USERNAME: ${MONGO_RESTORE_USERNAME:?MONGO_RESTORE_USERNAME is required}
+      MONGO_RESTORE_PASSWORD: ${MONGO_RESTORE_PASSWORD:?MONGO_RESTORE_PASSWORD is required}
+    volumes:
+      - mongo_data:/data/db
+      - mongo_config:/data/configdb
+      - ./deploy/mongo/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --eval 'db.getSiblingDB(process.env.MONGO_DATABASE).runCommand({ ping: 1 }).ok' --username \"$$MONGO_APP_USERNAME\" --password \"$$MONGO_APP_PASSWORD\" --authenticationDatabase \"$$MONGO_DATABASE\"",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks: [data]
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      # This Compose file is the local HTTP-only stack. Production mode
+      # intentionally rejects non-HTTPS browser origins.
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 5000
+      MONGODB_URI: ${COMPOSE_MONGODB_URI:?COMPOSE_MONGODB_URI is required}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      CLIENT_URL: ${PUBLIC_APP_URL:-http://localhost:8080}
+      CLIENT_URLS: ${CLIENT_URLS:-http://localhost:8080}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-8}
+      GOOGLE_FORM_APPS_SCRIPT_URL: ${GOOGLE_FORM_APPS_SCRIPT_URL:-}
+      UPLOAD_DIR: /app/storage/uploads
+      TRUST_PROXY: ${TRUST_PROXY:-0}
+      # Export resource guards: output-byte ceiling and concurrent-export cap.
+      EXPORT_MAX_BYTES: ${EXPORT_MAX_BYTES:-67108864}
+      EXPORT_MAX_CONCURRENT: ${EXPORT_MAX_CONCURRENT:-2}
+    volumes:
+      - uploads_data:/app/storage/uploads
+    depends_on:
+      mongo:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      # The export scratch space holds bounded generated export files; the
+      # size covers EXPORT_MAX_BYTES multiplied by EXPORT_MAX_CONCURRENT.
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    networks: [app, data]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    environment:
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://localhost:8080}
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /var/cache/nginx:size=32m,mode=0755
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    networks: [app]
+
+networks:
+  app:
+  data:
+    internal: true
+
+volumes:
+  mongo_data:
+  mongo_config:
+  uploads_data:

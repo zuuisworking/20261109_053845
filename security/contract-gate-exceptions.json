@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "policy": {
+    "note": "The static contract gate compares docs/api/overview.md with the Express route table and with the paths the frontend client calls. Any difference must be listed here with an owner, an expiry date, and a rationale. Untracked differences fail the build, and expired entries fail the build. An entry that no longer corresponds to a difference is removed: a stale entry would silently re-open a hole that the documentation has already closed."
+  },
+  "exceptions": [
+    {
+      "id": "operational-health-endpoint",
+      "type": "operational-endpoint",
+      "method": "GET",
+      "path": "/api/health",
+      "owner": "platform-owner",
+      "expiresAt": "2026-12-31",
+      "rationale": "The liveness endpoint is an operational endpoint outside the /api/v1 REST contract. It is described in docs/operations/deployment-reality.md and is used by the container health checks, not by the browser client."
+    },
+    {
+      "id": "operational-readiness-endpoint",
+      "type": "operational-endpoint",
+      "method": "GET",
+      "path": "/api/ready",
+      "owner": "platform-owner",
+      "expiresAt": "2026-12-31",
+      "rationale": "The readiness endpoint is an operational endpoint outside the /api/v1 REST contract. It is described in docs/operations/deployment-reality.md and is the signal the deployment smoke check must use."
+    }
+  ],
+  "notes": [
+    {
+      "id": "contract-export-filter-parameter",
+      "owner": "frontend-owner",
+      "expiresAt": "2026-12-31",
+      "rationale": "docs/api/overview.md documents the export filter parameter of GET /api/v1/exports/transformers as `view`, and frontend/src/services/api.ts sends `view` as well. The parameter-level divergence that this note used to record is resolved; the note is kept so that the resolution and its owner remain visible. The gate compares method and path only, so a parameter-level divergence is never path-matched by the gate."
+    },
+    {
+      "id": "contract-auth-avatar-endpoints",
+      "owner": "backend-owner",
+      "expiresAt": "2026-12-31",
+      "rationale": "POST /api/v1/auth/profile/avatar and GET /api/v1/auth/avatar/:userId were previously registered as undocumented-implementation exceptions. docs/api/overview.md now documents both of them (the multipart avatar upload and the avatar download), so the difference no longer exists and the exceptions were removed. If the documentation is reverted, the exceptions must be re-registered with a fresh review."
+    }
+  ]
+}
